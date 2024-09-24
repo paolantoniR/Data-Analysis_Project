@@ -1,0 +1,257 @@
+---
+title: "Regression Analysis"
+author: "Leo Artoni, Riccardo Paolantoni"
+date: "19/1/2023"
+output: pdf_document
+editor_options: 
+  markdown: 
+    wrap: sentence
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+```{r include=FALSE}
+library(tidyverse)
+library(dbplyr)
+library(ggplot2)
+library(GGally)
+library(ggcorrplot)
+library(gridExtra)
+library(dataPreparation)
+library(leaps)
+library(glmnet)
+library(tree)
+require(car)
+library(randomForest)
+require(factoextra)
+library(moments)
+```
+
+## 1. Describe the dataset
+
+The dataset that we have chosen is "BrazHousesRent.cvs", it contains information on 10692 houses in various Brazilian cities.
+As already specified by the description of the dataset the data has been gathered through a *web-crawler* therefore it presents some complications that will be further discussed later.
+With the function *glimpse()* we can take an actual glimpse at the data and at the different types of variables that we are working with.
+By looking at the summary we can already notice some particular numbers in some of the variables such as the big leap between the 3rd quartile and the maximum value of the variables *hoa*, *property_tax* and *area*.
+We also checked for the amount of zeros in the dataset and displayed the percentage of each variable, here we faced another problem, the variables *parking_space*, *hoa* and *property_tax* have a high percentage of zeros (\~25%, \~22% and \~15%), this substantial presence of zeros could be explained by the fact that some houses may not have any parking spaces and others may not be in any Homeowners association, but we are not sure how to explain this phenomenon with regards to property tax, this could be due to difficulties that the web-crawler had in order to get this type of information.
+This being said, we decided to remove any observations with zeros in both *hoa* **and** *property_tax*.
+After checking for NAs and removing some duplicates a new variable called *data* is created, this will be the variable used along all steps of the analysis.
+
+```{r}
+Starter <- read.csv('BrazHousesRent.csv')
+glimpse(Starter)
+summary(Starter)
+
+numZeros <- colSums(Starter==0)/nrow(Starter)*100
+
+data <- Starter %>% 
+  filter(Starter$hoa != 0 & Starter$property_tax != 0)
+
+numZeros <- colSums(data==0)/nrow(data)*100
+
+sum(is.na(data))
+
+sum(duplicated(data))
+
+data <- distinct(data)
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+#visualize categorical variables
+p1 <- ggplot(data, aes(x = city)) + 
+  geom_bar()
+p2 <- ggplot(data, aes(x = animal)) + 
+  geom_bar()
+p3 <- ggplot(data, aes(x = furniture)) + 
+  geom_bar()
+p4 <- ggplot(data, aes(x = floor)) + 
+  geom_bar()
+
+grid.arrange(p1,p2,p3,p4)
+
+
+#visualize target variable
+ggplot(data, aes(x = rent_amount)) + 
+  geom_histogram()
+
+data %>%
+  select(where(is.numeric)) %>% 
+  ggpairs()
+
+```
+
+In the plots above *ggplot* and *gridExtra* are used in order to better visualize the categorical variables and the target variable that we are interested in.
+From these plots it is possible to observe a disparity in the variable *city* where the city *São Paulo* is by far the most predominant observation, and that the *floor* variable is quite messy with most of its observations being that the houses are placed at the ground floor.
+We also used the function *ggpairs()* on all numerical variables in order to better visualize the distribution of the observations, this allowed us to notice that there are many outliers that skew the distribution.
+
+## 2. Data manipulation
+
+In the data manipulation phase we have first converted all the *character variables* into *factor*, removed the outliers by using the library *dataPreparation;* the function *remove_percentile_outlier()* has also been used here.
+(note that *remove_sd_outliers()* could have been used in this context but both functions lead to similar results).
+We have then decided to create a new variable called *house_size* that simply takes the values from *rooms*, *bathroom*, *parking_spaces* and adds them together and assigns them to a category depending on the magnitude of the value (ex. 3 = "very small" and 30 = "very big").
+
+```{r}
+data <- data %>% 
+  mutate_if(is.character, as.factor)
+
+data <- remove_percentile_outlier(data)
+
+data <-  data %>% 
+  mutate(house_size = rooms + bathroom + parking_spaces)
+
+house_size = data %>%
+  cut(x = data$house_size,
+      breaks = c(min(data$house_size),3,4,6,7,max(data$house_size)),
+      labels = c("Very_Small","Small","Normal","Big","Very_Big"),
+      include.lowest = T,
+      right = T)
+table(house_size)
+data$house_size = house_size
+
+data %>%
+  select(where(is.numeric)) %>% 
+  ggpairs()
+
+```
+
+## 3. Variables selection and dealing with Skewness
+
+```{r}
+data <- data %>% 
+  select(-rooms,-bathroom, -parking_spaces, -fire_insurance, -floor)
+
+data %>% 
+  select(where(is.numeric)) %>% 
+  skewness(na.rm = TRUE)
+
+data <- data %>%
+  mutate(across(c(hoa, area, property_tax, rent_amount),function(x)log10(x)))
+
+data %>%
+  select(where(is.numeric)) %>% 
+  ggpairs()
+
+```
+
+Looking at the *ggpairs* it is possible to detect an unusual pattern relating *fire_insurance* and *rent_amount* (with a correlation of almost 99%), this has led us to remove it from the variables; along with *rooms*, *bathroom*, *parking_spaces:* that are now stored inside *house_size;* and the variable *floor*.
+We have then employed the library *moments* to compute the skewness of the variables.
+As we can see the variables are mostly positively skewed (right skewed) this is why in the next step a **square root transformation** has been applied to the variables.
+Parametric methods, assume that there is an approximately normally distributed dataset. This is why we can consider transformations of either the independent or dependent variable or both in order to obtain a linear relationship.
+After the transformation we see an improved distribution across all variables.
+
+## 4. Build a predictive model
+
+This task requires to build a predictive model in order to find out the rent amount according to the house specifics.
+First of all, we have decided to build a *Multiple linear regression* model as a "*benchmark*".
+In order to validate the results of the prediction we used as a resampling method the *validation set* approach and divided the dataset into two "*subsets*": 70% of the data has been used as **training set** and the remaining 30% will be the **validation** or **test set**.
+
+```{r}
+set.seed(1)
+data <- data[,c(6,1,2,3,4,5,7,8)]
+idx_train = sample.int(n = nrow(data), size = floor(.7*nrow(data)), replace = F)
+data.train = data[idx_train, ]
+data.valid  = data[-idx_train, ]
+
+#multiple linear regression with all predictors
+lm.fit <- lm(rent_amount ~ ., data.train)
+summary(lm.fit)
+
+pred_lm.fit <-  predict(lm.fit, data.valid[,-1])
+mean((data.valid$rent_amount - pred_lm.fit)^2)
+
+par(mfrow = c(2,2))
+plot(lm.fit)
+
+vif(lm.fit) #no multicollinearity
+
+```
+
+As we can see from the summary of the model the majority of the coefficients are significant (with a small p-value) except for **city** which has the value *Porto Alegre* that is not significant, this may be related to the fact that there are not many observation in *Porto Alegre*.
+Both the **R-squared** and the Adjusted **R-squared** are somewhat good considering the nature of the dataset with 65% of variance explained.
+We then computed the MSE by using the values of rent amount stored in *data.valid* (the test set) and the predicted values from the model resulting in a good value of 0.033.
+In addition to the model we decided to check for **multicollinearity** since the variables are all highly correlated.
+By using the function *vif()* we computed the variance inflation factor, which measures how much the variance of a regression coefficient is inflated due to multicollinearity in the model and concluded that the values are acceptable in order to assume that there is no multicollinearity.
+If we look at the plot of the residuals is it possible to notice a slight **funnel shape** that may suggests **heteroscedasticity**.
+
+```{r}
+lm.fit <- lm(log(rent_amount) ~ ., data.train)
+summary(lm.fit)
+pred_lm.fit <-  predict(lm.fit, data.valid[,-1])
+mean((data.valid$rent_amount - pred_lm.fit)^2)
+
+par(mfrow = c(2,2))
+plot(lm.fit)
+```
+
+After performing a logarithmic transformation of the dependent variable there is no observable significant change in the shape or in the results of the model, other than a very small increase of the R-squared.
+
+We then fitted a **Ridge regression**.
+The ridge regression needs a *model matrix* in order to work since it only takes numerical values (it transforms all categorical variables into dummy variables).
+[The *glmnet()* function takes two specific arguments: the **alpha** argument which specifies the type of model that we want to implement (ridge or lasso) and **lambda**, a parameter unique to lasso and Ridge regressions.
+In this case, we have implemented a **grid** of values for lambda that goes from -2 to 10.
+
+```{r}
+x.train <- model.matrix(rent_amount ~ ., data.train) [, -1]
+y.test <- data.valid$rent_amount
+
+x.test <- model.matrix(rent_amount ~ ., data.valid) [, -1]
+
+cv.ridge <- cv.glmnet(x.train,
+                      data.train$rent_amount,
+                     alpha = 0)
+
+lambda = cv.ridge$lambda.min
+cv.ridge$lambda.min
+
+ridge.mod <- glmnet(x.train, data.train$rent_amount, alpha = 0, lambda = lambda, thresh = 1e-12)
+
+ridge.pred <- predict(ridge.mod, s = lambda , newx = x.test)
+mean((ridge.pred - y.test)^2)
+
+predict(ridge.mod, s = lambda, type = "coefficients")
+```
+
+The results of the Ridge regression are slightly better than the standard multiple linear regression (as we can see from the MSE).
+In this code the optimal value for **lambda** was computed through cross-validation and is displayed above (~0.022).
+We decided to implement the Ridge regression (with respect to the lasso regression) because we have already done some variable selection and we considered the remaining ones to be significant.
+
+```{r}
+tree.fit <- tree(rent_amount ~ . , data = data.train)
+summary(tree.fit)
+par(mfrow = c (1,1))
+plot(tree.fit)
+text(tree.fit, pretty=0, cex = 0.7)
+
+cv.tree.fit <- cv.tree(tree.fit)
+plot(cv.tree.fit$size, cv.tree.fit$dev, type = "b")
+
+
+pred_tree.fit = predict(tree.fit, data.valid[,-1])
+
+mean((pred_tree.fit - data.valid$rent_amount)^2)
+```
+
+After implementing the Ridge regression, we decided to implement both a **regression tree model** and a **Random forest model**.
+As one can see from the summary, the resulting tree is composed of 7 *leafs*, and only 4 variables are actually used in the model: *hoa* ,that is also the first split (minimizes the most the RSS), *property_tax*, *city* and *area*.
+The plot gives us insight on the splits of the tree and the ending leaves.
+We decided to not implement *pruning* because the function **cv.tree()** selects (via cross-validation) the most complex tree composed of 7 ending leafs.
+The performance of the model is quite good on the validation set, positioning at the second position, after the multiple linear regression with an MSE = 0.0415.
+
+```{r}
+rf.fit <-  randomForest(rent_amount ~., data = data.train, mtry = 3, importance = T, ntree=1e3)
+rf.fit
+pred_rf <-  predict(rf.fit, data.valid)
+mean((pred_rf - data.valid$rent_amount)^2)
+```
+
+Finally, we have the **random forest**.
+We built a forest composed of 1000 trees and only used 3 variables for each split since it is standard for regression random forests to use the number of variables divided by 3 (p/3 where p is the number of variables), using all variables (**bagging**) led to worse results (less variance and worst MSE) which may be due to overfitting in the model.
+As one could guess, the results of the random forest are the best overall.
+
+## Conclusions
+
+As a conclusion, the model with the best results is definitely the **Random Forest** but it is important to note that the **variance explained** and the **MSE** are not too far from the way simpler models of **multiple linear regression** and **ridge regression**, this may be due to the way the dataset is constructed and how the data is scaled/manipulated (tree models perform significantly better on scaled data).
+In the previous analysis, any dimensional reduction methods such as best subset selection or step-wise selection are not present since an heavy *a priori* variable selection was made in order to clean the dataset.
+After observing the selected variables in the different models, we can first say that **regression tree** shows the 7 most significant ones. This being said, if we were to reduce this number, the most important characteristics in order to determine the apartments with the highest rent prizes in Brazil are the *Monthly Homeowners Association Tax* and the *Property Tax*

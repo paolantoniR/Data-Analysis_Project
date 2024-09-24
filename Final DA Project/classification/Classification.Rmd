@@ -1,0 +1,270 @@
+---
+title: "Classification"
+author: "Leo Artoni, Riccardo Paolantoni"
+date: "19/01/2023"
+output: pdf_document
+---
+```{r include=FALSE}
+library(tidyverse)
+library(pROC)
+library(caret)
+library(glmnet)
+library(randomForest)
+library(cluster)
+library(ggcorrplot)
+library(dplyr)
+library(dataPreparation)
+```
+
+## Dataset and data cleaning\
+
+The Wine quality dataset presents 4898 observations (each one representing a different wine) and their characteristics. In the summary below we can observe that they are all numerical variables representing different parameters indicating different chemical properties in each wine.
+
+First of all, we checked for NA values and only considered the distinct values within the dataset (eliminating duplicates). There were 0 NA values and removing duplicates reduced the number of observations to 3961.
+After plotting the data for the different variables we noticed the presence of some outliers, which we have removed using remove_percentile_outlier.
+
+```{r echo=FALSE}
+original = read.csv("WineQuality.csv")
+str(original)
+summary(original)
+
+sum(is.na(original))
+sum(duplicated(original))
+df = distinct(original)
+
+df %>% 
+  select_if(is.numeric) %>% 
+  gather() %>% 
+  ggplot(aes(value))+
+  facet_wrap(~key,scales = "free")+
+  geom_boxplot(fill = 'steelblue')
+
+df <- remove_percentile_outlier(df)
+
+```
+
+## Data Visualization\
+
+After removing the outliers we tried to understand the distribution of the dataset. We can see that the variables are normally distributed meaning that the set has been properly cleaned and is ready for the analysis. 
+
+```{r echo=FALSE}
+df %>% 
+  gather() %>% 
+  ggplot(aes(value))+
+  facet_wrap(~key,scales = "free")+
+  geom_boxplot(fill = 'steelblue')
+
+df %>% 
+  select_if(is.numeric) %>% 
+  gather() %>% 
+  ggplot(aes(value))+
+  facet_wrap(~key,scales = "free")+
+  geom_density()
+
+df <- df %>%
+  mutate(across(c(residual.sugar, chlorides),function(x)log10(x)))
+
+df %>% 
+  select_if(is.numeric) %>% 
+  gather() %>% 
+  ggplot(aes(value))+
+  facet_wrap(~key,scales = "free")+
+  geom_density()
+
+```
+As one can see, some of the variables distributions are right-skewed (specifically, *residual.sugar* and *chlorides*), this is why we performed a log-transformation. This allowed to improve the distribution for *chlorides*, but not for *residual.sugar* (which we have decided to remove).
+
+
+## Classification\
+
+We then prepared the classification models. Our objective was to classify wines according to their characteristics. 
+By using the variable *quality* we divided the wines into two categories: bad wines (score < 6) and good wines (>= 6). This transformation enabled us to transform the target variable into a bi-valued variable.
+
+```{r echo=FALSE}
+
+quality = df %>%
+  cut(x = df$quality,
+      breaks = c(min(df$quality),5,max(df$quality)),
+      labels = c("Bad", "Good"),
+      include.lowest = T,
+      right = T)
+table(quality)
+df$quality = quality
+
+df %>%
+    select_if(is.numeric) %>%
+    cor() %>%
+    ggcorrplot(lab = TRUE, legend.title = 'Correlation',lab_size=2)
+
+df <- df %>% 
+  select(-density, -residual.sugar, -total.sulfur.dioxide)
+
+df <- df %>% 
+  mutate_at(c(1:8), funs(c(scale(.))))
+```
+
+Next, we studied the correlation between the different variables, with the use of a correlation matrix, and removed the highly correlated ones (both positively and negatively correlated). 
+From said matrix we have observed a high positive correlation between *density*, *residual.sugar*, *total.sulfur.dioxide* and *free.sulfur.dioxide* and a high negative correlation between *alcohol*, *density*. 
+To avoid redundancy we have decided to remove the *density*, *residual.sugar* and *total.sulfur.dioxide* variables. This left us with 9 variables, 8 of which are predictors.
+
+In order to properly evaluate the accuracy of the models, we decided to use a validation set approach. This is useful to compare the their respective performances (70 percent of the complete dataset was used as a training set while the remaining 30 percent was used for the test set).
+
+```{r echo=FALSE}
+set.seed(66)
+idx_train = sample.int(n = nrow(df), size = floor(.7*nrow(df)), replace = F)
+data.train = df[idx_train, ]
+data.valid  = df[-idx_train, ]
+```
+
+## Logistic regression\
+
+As a first approach, we chose to perform a logistic regression. In the model we used all of the 8 predictors. 
+To specify that we are fitting a logistic regression we have set the family parameter of the glm function to binomial.
+After computing all the probabilities of the response variable, we assigned a "Good" value to all observations above the threshold (which we set to 0.6 because of a prevalence of "Good" wines over "Bad" ones), all others were defined as "Bad".
+
+```{r echo=FALSE}
+glm.fits <- glm(quality ~ ., data = data.train, family = binomial)
+summary(glm.fits)
+
+glm.probs <- predict(glm.fits, data.valid, type = "response")
+
+glm.pred <- rep("Bad", 976)
+glm.pred[glm.probs > .60] <- "Good"
+
+table(glm.pred, data.valid$quality)
+
+mean(glm.pred == data.valid$quality)
+
+```
+
+As we can clearly see from the confusion matrix the model's accuracy is about 76%.
+It should also be noted that the summary describing the model also highlights the fact that *pH* and *citric.acid* have a high p-value, meaning they are not statistically significant (we also tried to fit a model excluding these variables, but this did not improve the results. For this reason we have decided not to include it in this analysis).
+
+After the confusion matrix, we generated the ROC curve and the corresponding AUC.
+
+```{r echo=FALSE}
+roc1 = roc(
+  response = data.valid$quality,
+  predictor = glm.probs,
+  auc = T,
+)
+
+plot(
+  roc1,
+  print.auc = T,
+  auc.polygon = T,
+  auc.polygon.col = 'lightblue'
+)
+```
+
+## Lasso regression\
+
+Considering some of the variables do not appear to be highly significant, we decided to implement a Lasso regression.
+This model has the particularity of having a parameter called lambda, which impacts magnitude of the coefficients of the regression.
+
+We started by converting the training set into a model matrix and obtained the optimal value of lambda (0.005) through cross-validation. 
+
+```{r echo=FALSE}
+x =  model.matrix(quality~., data.train)[, -9]
+y = ifelse(data.train$quality == 'Good', 1, 0)
+
+cv.lasso <- cv.glmnet(x,y,
+                     family = 'binomial',
+                     alpha = 1)
+
+lambda = cv.lasso$lambda.min
+cv.lasso$lambda.min
+
+lasso.fit = glmnet(x,y,
+                   family = 'binomial',
+                   alpha = 1,
+                   lambda = lambda)
+
+coef(lasso.fit)
+
+xtest <- model.matrix(quality~., data.valid) [, -9]
+
+probabilities <- lasso.fit %>% 
+  predict(newx = xtest)
+
+ytest <- ifelse(probabilities > 0.5, "Good", "Bad")
+
+table(ytest, data.valid$quality)
+
+mean(ytest == data.valid$quality)
+```
+
+Following the lasso regression, the variables *citric.acid* and *free.sulfur.dioxide* were removed.
+Looking at the accuracy of this model (0.73) we observe that it is performing worse than the logistic regression. 
+
+```{r echo=FALSE}
+roc2 = roc(
+  response = data.valid$quality,
+  predictor = probabilities,
+  auc = T,
+  col = 'green'
+)
+
+plot(
+  roc2,
+  print.auc = T,
+  auc.polygon = T,
+  auc.polygon.col = 'lightgreen'
+)
+```
+
+## Random forest\
+
+The third and final model is a Random forest which is an ensemble method. First of all we created a forest composed of 1000 trees.
+By default we use the square root of p (p = number of parameters) as the value of the mtry parameter when building a random forest of classification trees. 
+
+```{r echo=FALSE}
+rf.fit <- randomForest(
+  quality ~ .,
+  data = data.train,
+  ntree = 1000,
+  mtry = 3,
+  importance = T,
+)
+rf.fit
+
+rfPred <- rf.fit %>% 
+  predict(data.valid, type = 'class')
+
+rfProb<- rf.fit %>% 
+  predict(data.valid, type = 'prob')
+
+mean(rfPred == data.valid$quality)
+
+```
+
+We obtain an accuracy of approximately 77 percent, which is higher than the ones of the previous models (as we could have expected).
+
+After the confusion matrix we generated the ROC curve and the corresponding AUC.
+
+```{r echo=FALSE}
+rfProb <- rfProb[, 1]
+
+roc3 = roc(
+  response = data.valid$quality,
+  predictor = rfProb,
+  auc = T,
+  col = 'green'
+)
+
+plot(
+  roc3,
+  print.auc = T,
+  auc.polygon = T,
+  auc.polygon.col = 'yellow'
+)
+```
+
+## Conclusions
+
+We can conclude that the best results are obtained using the **Random Forest**. 
+The most significant variables in order to determine the quality of a wine are the *volatile acidity* and the quantity of *chlorides*, this can be observed from the results of the Lasso regression. 
+
+
+*Further research*
+As an oter bit of food for thought, it would be interesting to perform statistical studies in order to determine which characteristics define whether a wine is red or white. This could be done by using classification methods. (#TeamRed or #TeamWhite)
